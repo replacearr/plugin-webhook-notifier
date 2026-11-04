@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Cross-build, checksum, write release plugin.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, sys
+
+          platforms = ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64", "windows/amd64"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag[1:] if tag.startswith("v") else tag
+          if not re.match(r"^[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise SystemExit(f"tag {tag!r} must be vMAJOR.MINOR.PATCH")
+
+          root = pathlib.Path.cwd().resolve()
+          meta = json.loads((root / "plugin.json").read_text())
+          plugin_id = meta["id"]
+          meta["version"] = version
+          meta["homepage"] = f"https://github.com/{repo}"
+          meta["repository"] = f"https://github.com/{repo}"
+          meta["module"] = f"github.com/{repo}"
+
+          out_dir = root / ".artifacts" / "bin"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          assets = []
+
+          for plat in platforms:
+              goos, goarch = plat.split("/")
+              name = f"{plugin_id}_{goos}_{goarch}"
+              if goos == "windows":
+                  name += ".exe"
+              dest = out_dir / name
+              env = os.environ.copy()
+              env["CGO_ENABLED"] = "0"
+              env["GOOS"] = goos
+              env["GOARCH"] = goarch
+              print(f"building {goos}/{goarch} -> {dest}", flush=True)
+              proc = subprocess.run(
+                  ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", str(dest), "."],
+                  cwd=str(root),
+                  env=env,
+                  capture_output=True,
+                  text=True,
+              )
+              if proc.returncode != 0:
+                  sys.stderr.write(proc.stdout + "\n" + proc.stderr + "\n")
+                  raise SystemExit(f"go build failed for {goos}/{goarch}")
+              data = dest.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              assets.append({
+                  "goos": goos,
+                  "goarch": goarch,
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
+                  "sha256": digest,
+                  "size": len(data),
+              })
+              print(f"  sha256={digest} size={len(data)}", flush=True)
+
+          release_meta = {
+              "id": meta["id"],
+              "name": meta["name"],
+              "version": version,
+              "author": meta["author"],
+              "description": meta["description"],
+              "types": meta["types"],
+              "homepage": meta["homepage"],
+              "repository": meta["repository"],
+              "minReplacearrVersion": meta["minReplacearrVersion"],
+              "assets": assets,
+          }
+          (root / ".artifacts" / "plugin.json").write_text(json.dumps(release_meta, indent=2) + "\n")
+          print("wrote .artifacts/plugin.json", flush=True)
+          PY
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .artifacts/bin/*
+            .artifacts/plugin.json
+          generate_release_notes: true
